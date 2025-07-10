@@ -30,8 +30,11 @@ import org.slf4j.LoggerFactory;
 import jp.vemi.seasarbatis.core.builder.SBDeleteBuilder;
 import jp.vemi.seasarbatis.core.builder.SBSelectBuilder;
 import jp.vemi.seasarbatis.core.builder.SBUpdateBuilder;
+import jp.vemi.seasarbatis.core.config.SBOptimisticLockConfig;
 import jp.vemi.seasarbatis.core.criteria.ComplexWhere;
 import jp.vemi.seasarbatis.core.criteria.SimpleWhere;
+import jp.vemi.seasarbatis.core.entity.SBOptimisticLockSupport;
+import jp.vemi.seasarbatis.core.entity.SBOptimisticLockSupport.OptimisticLockInfo;
 import jp.vemi.seasarbatis.core.query.SBSelect;
 import jp.vemi.seasarbatis.core.sql.executor.SBQueryExecutor;
 import jp.vemi.seasarbatis.core.transaction.SBTransactionCallback;
@@ -58,6 +61,7 @@ public class SBJdbcManager {
     private final SqlSessionFactory sqlSessionFactory;
     private final SBTransactionManager txManager;
     private final SBQueryExecutor queryExecutor;
+    private final SBOptimisticLockConfig optimisticLockConfig;
 
     /**
      * {@link SBJdbcManager}を構築します。
@@ -65,7 +69,18 @@ public class SBJdbcManager {
      * @param sqlSessionFactory {@link SqlSessionFactory}
      */
     public SBJdbcManager(SqlSessionFactory sqlSessionFactory) {
+        this(sqlSessionFactory, new SBOptimisticLockConfig());
+    }
+
+    /**
+     * {@link SBJdbcManager}を構築します。
+     *
+     * @param sqlSessionFactory {@link SqlSessionFactory}
+     * @param optimisticLockConfig 楽観的排他制御設定
+     */
+    public SBJdbcManager(SqlSessionFactory sqlSessionFactory, SBOptimisticLockConfig optimisticLockConfig) {
         this.sqlSessionFactory = sqlSessionFactory;
+        this.optimisticLockConfig = optimisticLockConfig;
         this.txManager = new SBTransactionManager(sqlSessionFactory);
         this.queryExecutor = new SBQueryExecutor(sqlSessionFactory.getConfiguration(), txManager.getTransactionOperation());
     }
@@ -76,7 +91,17 @@ public class SBJdbcManager {
      * @param dataSource {@link DataSource}
      */
     public SBJdbcManager(DataSource dataSource) {
-        this(createSqlSessionFactory(dataSource));
+        this(createSqlSessionFactory(dataSource), new SBOptimisticLockConfig());
+    }
+
+    /**
+     * {@link SBJdbcManager}を構築します。
+     *
+     * @param dataSource {@link DataSource}
+     * @param optimisticLockConfig 楽観的排他制御設定
+     */
+    public SBJdbcManager(DataSource dataSource, SBOptimisticLockConfig optimisticLockConfig) {
+        this(createSqlSessionFactory(dataSource), optimisticLockConfig);
     }
 
     /**
@@ -304,6 +329,7 @@ public class SBJdbcManager {
      * @param isIndependentTransaction 独立したトランザクションで実行するかどうか
      * @return 更新されたエンティティ
      * @throws IllegalArgumentException 主キーが設定されていない場合
+     * @throws SBOptimisticLockException 楽観的排他制御に失敗した場合
      */
     @SuppressWarnings("unchecked")
     public <T> T update(T entity, boolean isIndependentTransaction) {
@@ -315,11 +341,22 @@ public class SBJdbcManager {
                 throw new SBIllegalStateException("主キーが設定されていません");
             }
 
+            // 楽観的排他制御の情報を取得
+            OptimisticLockInfo lockInfo = SBOptimisticLockSupport.getOptimisticLockInfo(entity, optimisticLockConfig);
+            
             Map<String, Object> params = getEntityParams(entity);
             // 主キーを params から削除
             pkValues.keySet().forEach(params::remove);
 
             StringBuilder sql = new StringBuilder("UPDATE " + tableName + " SET ");
+
+            // 楽観的排他制御用カラムの値を更新（バージョン番号のインクリメントや更新日時の設定）
+            if (lockInfo.isEnabled()) {
+                Object newOptimisticLockValue = SBOptimisticLockSupport.updateOptimisticLockValue(entity, lockInfo);
+                if (newOptimisticLockValue != null) {
+                    params.put(lockInfo.getColumnName(), newOptimisticLockValue);
+                }
+            }
 
             // 主キー以外のカラムを更新対象とする
             params.forEach((column, value) -> {
@@ -340,10 +377,23 @@ public class SBJdbcManager {
                 params.put("pk" + pkCount, pk.getValue());
             }
 
+            // 楽観的排他制御のWHERE句条件を追加
+            if (lockInfo.isEnabled()) {
+                String optimisticLockCondition = SBOptimisticLockSupport.buildOptimisticLockCondition(lockInfo, params);
+                sql.append(optimisticLockCondition);
+            }
+
             int updatedRows = queryExecutor.execute(sql.toString(), params, UPDATE);
             if (updatedRows == 0) {
-                throw new SBOptimisticLockException("更新対象のレコードが見つかりませんでした。他のトランザクションによって更新された可能性があります。", entity,
-                        pkValues.keySet().toArray(new String[0]));
+                if (lockInfo.isEnabled()) {
+                    throw new SBOptimisticLockException(
+                            "楽観的排他制御エラー: レコードが他のトランザクションによって更新されています。", 
+                            entity, 
+                            lockInfo.getColumnName());
+                } else {
+                    throw new SBOptimisticLockException("更新対象のレコードが見つかりませんでした。他のトランザクションによって更新された可能性があります。", entity,
+                            pkValues.keySet().toArray(new String[0]));
+                }
             }
 
             List<T> newEntity = queryExecutor
@@ -567,6 +617,15 @@ public class SBJdbcManager {
     // ---------- Getter ----------
     public SBTransactionManager getTransactionManager() {
         return this.txManager;
+    }
+
+    /**
+     * 楽観的排他制御設定を取得します。
+     * 
+     * @return 楽観的排他制御設定
+     */
+    public SBOptimisticLockConfig getOptimisticLockConfig() {
+        return this.optimisticLockConfig;
     }
 
     // ---------- Utility ----------
